@@ -1,0 +1,247 @@
+<h1 id="reaching-for-the-stars-with-ansible-operator">Reaching for the Stars with Ansible Operator</h1>
+<p>By: David Zager</p>
+<p>In this post I will show you how to use Roles published to <a href="https://galaxy.ansible.com">Ansible Galaxy</a> as an Operator to manage an application in Kubernetes. Reusing a Role in this way provides an example of how to create an Operator that simply installs an application with the flexibility to expand and customize the behavior organically as requirements dictate.</p>
+<p>I will leverage both the <a href="https://github.com/operator-framework/operator-sdk/blob/master/doc/ansible/user-guide.md">Ansible Operator</a> and the <a href="https://docs.ansible.com/ansible/latest/modules/k8s_module.html"><code>k8s</code> module</a> to demonstrate how you can use Ansible to create Kubernetes native applications. Ansible Operator, included in the <a href="https://github.com/operator-framework/operator-sdk">Operator SDK</a>, allows you to package your operational knowledge (how you install and maintain your application) in the form of Ansible Roles and Playbooks. Your ability to manage objects in Kubernetes when writing these Roles and Playbooks can be improved by the new <code>k8s</code> module.</p>
+<p><strong>Spoiler Alert</strong> Yes. It can be this easy to create an operator.</p>
+<pre><code>FROM quay.io/operator-framework/ansible-operator
+
+RUN ansible-galaxy install djzager.hello_world_k8s
+
+RUN echo $&#39;--- \n\
+- version: v1alpha1\n\
+  group: examples.djzager.io\n\
+  kind: HelloWorld\n\
+  role: /opt/ansible/roles/djzager.hello_world_k8s&#39; &gt; ${HOME}/watches.yaml
+</code></pre>
+<h1 id="introduction">Introduction</h1>
+<p>First, if you are reading this and are not aware of the <code>k8s</code> <a href="https://docs.ansible.com/ansible/latest/modules/k8s_module.html">Ansible Module</a> you should take a look. Introduced in Ansible 2.6, this module is designed to improve your ability to work with Kubernetes objects in Ansible in any Kubernetes distribution, including Red Hat OpenShift. <a href="https://www.ansible.com/blog/dynamic-kubernetes-client-for-ansible">This post on the Ansible blog</a> introduces the <code>k8s</code> module and the <a href="https://github.com/openshift/openshift-restclient-python">Red Hat OpenShift dynamic python client</a>. The dynamic client simply put, in my opinion, if you are interacting with Kubernetes objects in Ansible and are not using the <code>k8s</code> module, you are doing it wrong.</p>
+<p>Operators are purpose built to run a Kubernetes application, and the Operator SDK provides the tools to build, test, and package them. Ansible Operator exists to help you encode the operational knowledge of your application in Ansible. The workflow is designed to be simple; use <code>operator-sdk new --type=Ansible</code> to generate the necessary bits for an Ansible based Operator, add Ansible, and <code>operator-sdk build</code> you have an application built to run in Kubernetes. But if you already have a Role in Galaxy that manages your application in Kubernetes, it can be easier.</p>
+<p>In this post I will:</p>
+<ol>
+<li>Build an Ansible Role for managing a Hello World application in Kubernetes. This role will highlight what I believe makes the Ansible <code>k8s</code> module powerful.</li>
+<li>Publish my Role to Ansible Galaxy.</li>
+<li>Build an Ansible Operator using my Role published to Galaxy.</li>
+</ol>
+<p>Why would you use an Ansible Role from Galaxy to make an Operator? There are two reasons:</p>
+<ol>
+<li><a href="https://en.wikipedia.org/wiki/Don%27t_repeat_yourself">Don't repeat yourself</a>. Once I have written an Ansible Role for managing the Hello World application and published it to Ansible Galaxy, I would consume this with Ansible Operator when creating an Operator.</li>
+<li><a href="https://en.wikipedia.org/wiki/Separation_of_concerns">Separation of Concerns</a>. I want the Hello World Ansible Role to manage the application in Kubernetes and the operational logic to stay with the Operator. The operational logic in this example is designed to be simple, whenever a <code>HelloWorld</code> custom resource is created or modified, call the <code>djzager.hello_world_k8s</code> Role. However, <a href="#next-steps">in the future</a> this separation becomes more important. For example, adding validation for my Hello World application would be a solid addition to the Ansible Role, while managing the status of the <code>HelloWorld</code> custom resource would be operational logic specific to my Operator.</li>
+</ol>
+<h1 id="hello-kubernetes-meet-ansible">Hello Kubernetes, Meet Ansible</h1>
+<p><strong>Pre-Requisites</strong></p>
+<ol>
+<li>Ansible - See the <a href="https://docs.ansible.com/ansible/latest/installation_guide/intro_installation.html">installation guide</a> if you do not already have Ansible installed.</li>
+<li>[Optional] OpenShift python client. Only need this if you want to run locally. The installation instructions can be found <a href="https://github.com/openshift/openshift-restclient-python#installation">here</a>.</li>
+</ol>
+<p>Let's get started. The first thing I will do is use <code>ansible-galaxy</code> to create the Role skeleton:</p>
+<pre><code># I like clear names on projects.
+# In meta/main.yml I will make role_name: hello-world-k8s
+$ ansible-galaxy init ansible-role-hello-world-k8s
+</code></pre>
+<p>The first thing I like to do when creating a new Ansible Role is define all of my default values. This also serves as a way of documenting the possible configuration options for the Role, fortunately our Hello World example is not particularly complex. Here is my <code>defaults/main.yml</code>:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode yaml"><code class="sourceCode yaml"><a class="sourceLine" id="cb3-1" data-line-number="1"><span class="ot">---</span></a>
+<a class="sourceLine" id="cb3-2" data-line-number="2"><span class="co"># </span><span class="al">NOTE</span><span class="co">: meta.name(space) comes from CR metadata when run with Ansible Operator</span></a>
+<a class="sourceLine" id="cb3-3" data-line-number="3"><span class="co"># deploy/crds has an example CR for reference</span></a>
+<a class="sourceLine" id="cb3-4" data-line-number="4"><span class="fu">name:</span><span class="at"> </span><span class="st">&quot;{{ meta.name | default(&#39;hello-world&#39;) }}&quot;</span></a>
+<a class="sourceLine" id="cb3-5" data-line-number="5"><span class="fu">namespace:</span><span class="at"> </span><span class="st">&quot;{{ meta.namespace | default(&#39;hello-world&#39;) }}&quot;</span></a>
+<a class="sourceLine" id="cb3-6" data-line-number="6"><span class="fu">image:</span><span class="at"> docker.io/ansibleplaybookbundle/hello-world:latest</span></a>
+<a class="sourceLine" id="cb3-7" data-line-number="7"></a>
+<a class="sourceLine" id="cb3-8" data-line-number="8"><span class="co"># To uninstall from the cluster</span></a>
+<a class="sourceLine" id="cb3-9" data-line-number="9"><span class="co"># state: absent</span></a>
+<a class="sourceLine" id="cb3-10" data-line-number="10"><span class="fu">state:</span><span class="at"> present</span></a>
+<a class="sourceLine" id="cb3-11" data-line-number="11"></a>
+<a class="sourceLine" id="cb3-12" data-line-number="12"><span class="co"># The size of the hello-world deployment</span></a>
+<a class="sourceLine" id="cb3-13" data-line-number="13"><span class="fu">size:</span><span class="at"> 1</span></a></code></pre></div>
+<p>Once I have defined my default values I want to answer what this Role is going to do. My Hello World application needs:</p>
+<ol>
+<li>To get information about the available APIs in the cluster.</li>
+<li>Render a few templates and make sure they are either <code>present</code> or <code>absent</code> in the cluster.</li>
+</ol>
+<p>My <code>tasks/main.yml</code> looks like:</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode yaml"><code class="sourceCode yaml"><a class="sourceLine" id="cb4-1" data-line-number="1"><span class="ot">---</span></a>
+<a class="sourceLine" id="cb4-2" data-line-number="2"></a>
+<a class="sourceLine" id="cb4-3" data-line-number="3"><span class="kw">-</span> <span class="fu">name:</span><span class="at"> </span><span class="st">&quot;Get information about the cluster&quot;</span></a>
+<a class="sourceLine" id="cb4-4" data-line-number="4">  <span class="fu">set_fact:</span></a>
+<a class="sourceLine" id="cb4-5" data-line-number="5">    <span class="fu">api_groups:</span><span class="at"> </span><span class="st">&quot;{{ lookup(&#39;k8s&#39;, cluster_info=&#39;api_groups&#39;) }}&quot;</span></a>
+<a class="sourceLine" id="cb4-6" data-line-number="6"></a>
+<a class="sourceLine" id="cb4-7" data-line-number="7"><span class="kw">-</span> <span class="fu">name:</span><span class="at"> </span><span class="st">&#39;Set hello-world objects state={{ state }}&#39;</span></a>
+<a class="sourceLine" id="cb4-8" data-line-number="8">  <span class="fu">k8s:</span></a>
+<a class="sourceLine" id="cb4-9" data-line-number="9">    <span class="fu">state:</span><span class="at"> </span><span class="st">&#39;{{ state }}&#39;</span></a>
+<a class="sourceLine" id="cb4-10" data-line-number="10">    <span class="fu">definition:</span><span class="at"> </span><span class="st">&quot;{{ lookup(&#39;template&#39;, item.name) | from_yaml }}&quot;</span></a>
+<a class="sourceLine" id="cb4-11" data-line-number="11">  <span class="fu">when:</span><span class="at"> item.api_exists | default(True)</span></a>
+<a class="sourceLine" id="cb4-12" data-line-number="12">  <span class="fu">loop:</span></a>
+<a class="sourceLine" id="cb4-13" data-line-number="13">    <span class="kw">-</span> <span class="fu">name:</span><span class="at"> deployment.yml.j2</span></a>
+<a class="sourceLine" id="cb4-14" data-line-number="14">    <span class="kw">-</span> <span class="fu">name:</span><span class="at"> service.yml.j2</span></a>
+<a class="sourceLine" id="cb4-15" data-line-number="15">    <span class="kw">-</span> <span class="fu">name:</span><span class="at"> route.yml.j2</span></a>
+<a class="sourceLine" id="cb4-16" data-line-number="16">      <span class="fu">api_exists:</span><span class="at"> </span><span class="st">&quot;{{ True if &#39;route.openshift.io&#39; in api_groups else False }}&quot;</span></a></code></pre></div>
+<p>Before I show off the templates, I want to call attention to one line from my tasks file:</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode yaml"><code class="sourceCode yaml"><a class="sourceLine" id="cb5-1" data-line-number="1"><span class="fu">api_exists:</span><span class="at"> </span><span class="st">&quot;{{ True if &#39;route.openshift.io&#39; in api_groups else False }}&quot;</span></a></code></pre></div>
+<p>I use a <code>set_fact</code> to collect all of the available APIs in the cluster and this allows me to selectively render the template if a particular API is available, in this case <code>route.openshift.io</code>. Routes in OpenShift are not available by default in a Kubernetes cluster and I don't <em>need</em> them, so I only manage the Route object when the <code>route.openshift.io</code> API is present.</p>
+<p>Not only am I able to conditionally manage objects in the cluster based on available APIs, using Jinja2 templates, in my Deployment template I can use OpenShift's DeploymentConfig if the <code>apps.openshift.io</code> API is present in the cluster. Here is my <code>templates/deployment.yml.j2</code>:</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode yaml"><code class="sourceCode yaml"><a class="sourceLine" id="cb6-1" data-line-number="1"><span class="ot">---</span></a>
+<a class="sourceLine" id="cb6-2" data-line-number="2"></a>
+<a class="sourceLine" id="cb6-3" data-line-number="3"><span class="kw">{</span>% if &#39;apps.openshift.io&#39; in api_groups %<span class="kw">}</span></a>
+<a class="sourceLine" id="cb6-4" data-line-number="4"><span class="fu">apiVersion:</span><span class="at"> apps.openshift.io/v1</span></a>
+<a class="sourceLine" id="cb6-5" data-line-number="5"><span class="fu">kind:</span><span class="at"> DeploymentConfig</span></a>
+<a class="sourceLine" id="cb6-6" data-line-number="6"><span class="kw">{</span>% else %<span class="kw">}</span></a>
+<a class="sourceLine" id="cb6-7" data-line-number="7"><span class="fu">apiVersion:</span><span class="at"> apps/v1</span></a>
+<a class="sourceLine" id="cb6-8" data-line-number="8"><span class="fu">kind:</span><span class="at"> Deployment</span></a>
+<a class="sourceLine" id="cb6-9" data-line-number="9"><span class="kw">{</span>% endif %<span class="kw">}</span></a>
+<a class="sourceLine" id="cb6-10" data-line-number="10"><span class="fu">metadata:</span></a>
+<a class="sourceLine" id="cb6-11" data-line-number="11">  <span class="fu">name:</span><span class="at"> </span><span class="kw">{</span>{ name <span class="kw">}</span><span class="at">}</span></a>
+<a class="sourceLine" id="cb6-12" data-line-number="12">  <span class="fu">namespace:</span><span class="at"> </span><span class="kw">{</span>{ namespace <span class="kw">}</span><span class="at">}</span></a>
+<a class="sourceLine" id="cb6-13" data-line-number="13">  <span class="fu">labels:</span></a>
+<a class="sourceLine" id="cb6-14" data-line-number="14">    <span class="fu">app:</span><span class="at"> </span><span class="kw">{</span>{ name <span class="kw">}</span><span class="at">}</span></a>
+<a class="sourceLine" id="cb6-15" data-line-number="15">    <span class="fu">service:</span><span class="at"> </span><span class="kw">{</span>{ name <span class="kw">}</span><span class="at">}</span></a>
+<a class="sourceLine" id="cb6-16" data-line-number="16"><span class="fu">spec:</span></a>
+<a class="sourceLine" id="cb6-17" data-line-number="17">  <span class="fu">replicas:</span><span class="at"> </span><span class="kw">{</span>{ size <span class="kw">}</span><span class="at">}</span></a>
+<a class="sourceLine" id="cb6-18" data-line-number="18"><span class="kw">{</span>% if &#39;apps.openshift.io&#39; in api_groups %<span class="kw">}</span></a>
+<a class="sourceLine" id="cb6-19" data-line-number="19">  <span class="fu">selector:</span></a>
+<a class="sourceLine" id="cb6-20" data-line-number="20">    <span class="fu">app:</span><span class="at"> </span><span class="kw">{</span>{ name <span class="kw">}</span><span class="at">}</span></a>
+<a class="sourceLine" id="cb6-21" data-line-number="21">    <span class="fu">service:</span><span class="at"> </span><span class="kw">{</span>{ name <span class="kw">}</span><span class="at">}</span></a>
+<a class="sourceLine" id="cb6-22" data-line-number="22"><span class="kw">{</span>% else %<span class="kw">}</span></a>
+<a class="sourceLine" id="cb6-23" data-line-number="23">  <span class="fu">selector:</span></a>
+<a class="sourceLine" id="cb6-24" data-line-number="24">    <span class="fu">matchLabels:</span></a>
+<a class="sourceLine" id="cb6-25" data-line-number="25">      <span class="fu">app:</span><span class="at"> </span><span class="kw">{</span>{ name <span class="kw">}</span><span class="at">}</span></a>
+<a class="sourceLine" id="cb6-26" data-line-number="26">      <span class="fu">service:</span><span class="at"> </span><span class="kw">{</span>{ name <span class="kw">}</span><span class="at">}</span></a>
+<a class="sourceLine" id="cb6-27" data-line-number="27"><span class="kw">{</span>% endif %<span class="kw">}</span></a>
+<a class="sourceLine" id="cb6-28" data-line-number="28">  <span class="fu">template:</span></a>
+<a class="sourceLine" id="cb6-29" data-line-number="29">    <span class="fu">metadata:</span></a>
+<a class="sourceLine" id="cb6-30" data-line-number="30">      <span class="fu">labels:</span></a>
+<a class="sourceLine" id="cb6-31" data-line-number="31">        <span class="fu">app:</span><span class="at"> </span><span class="kw">{</span>{ name <span class="kw">}</span><span class="at">}</span></a>
+<a class="sourceLine" id="cb6-32" data-line-number="32">        <span class="fu">service:</span><span class="at"> </span><span class="kw">{</span>{ name <span class="kw">}</span><span class="at">}</span></a>
+<a class="sourceLine" id="cb6-33" data-line-number="33">    <span class="fu">spec:</span></a>
+<a class="sourceLine" id="cb6-34" data-line-number="34">      <span class="fu">containers:</span></a>
+<a class="sourceLine" id="cb6-35" data-line-number="35">      <span class="kw">-</span> <span class="fu">image:</span><span class="at"> </span><span class="kw">{</span>{ image <span class="kw">}</span><span class="at">}</span></a>
+<a class="sourceLine" id="cb6-36" data-line-number="36">        <span class="fu">name:</span><span class="at"> hello-world</span></a>
+<a class="sourceLine" id="cb6-37" data-line-number="37">        <span class="fu">ports:</span></a>
+<a class="sourceLine" id="cb6-38" data-line-number="38">        <span class="kw">-</span> <span class="fu">containerPort:</span><span class="at"> 8080</span></a>
+<a class="sourceLine" id="cb6-39" data-line-number="39">          <span class="fu">protocol:</span><span class="at"> TCP</span></a></code></pre></div>
+<p>My <code>templates/service.yml.j2</code>:</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode yaml"><code class="sourceCode yaml"><a class="sourceLine" id="cb7-1" data-line-number="1"><span class="ot">---</span></a>
+<a class="sourceLine" id="cb7-2" data-line-number="2"></a>
+<a class="sourceLine" id="cb7-3" data-line-number="3"><span class="fu">apiVersion:</span><span class="at"> v1</span></a>
+<a class="sourceLine" id="cb7-4" data-line-number="4"><span class="fu">kind:</span><span class="at"> Service</span></a>
+<a class="sourceLine" id="cb7-5" data-line-number="5"><span class="fu">metadata:</span></a>
+<a class="sourceLine" id="cb7-6" data-line-number="6">  <span class="fu">name:</span><span class="at"> </span><span class="kw">{</span>{ name <span class="kw">}</span><span class="at">}</span></a>
+<a class="sourceLine" id="cb7-7" data-line-number="7">  <span class="fu">namespace:</span><span class="at"> </span><span class="kw">{</span>{ namespace <span class="kw">}</span><span class="at">}</span></a>
+<a class="sourceLine" id="cb7-8" data-line-number="8">  <span class="fu">labels:</span></a>
+<a class="sourceLine" id="cb7-9" data-line-number="9">    <span class="fu">app:</span><span class="at"> </span><span class="kw">{</span>{ name <span class="kw">}</span><span class="at">}</span></a>
+<a class="sourceLine" id="cb7-10" data-line-number="10">    <span class="fu">service:</span><span class="at"> </span><span class="kw">{</span>{ name <span class="kw">}</span><span class="at">}</span></a>
+<a class="sourceLine" id="cb7-11" data-line-number="11"><span class="fu">spec:</span></a>
+<a class="sourceLine" id="cb7-12" data-line-number="12">  <span class="fu">ports:</span></a>
+<a class="sourceLine" id="cb7-13" data-line-number="13">  <span class="kw">-</span> <span class="fu">name:</span><span class="at"> web</span></a>
+<a class="sourceLine" id="cb7-14" data-line-number="14">    <span class="fu">port:</span><span class="at"> 8080</span></a>
+<a class="sourceLine" id="cb7-15" data-line-number="15">    <span class="fu">protocol:</span><span class="at"> TCP</span></a>
+<a class="sourceLine" id="cb7-16" data-line-number="16">    <span class="fu">targetPort:</span><span class="at"> 8080</span></a>
+<a class="sourceLine" id="cb7-17" data-line-number="17">  <span class="fu">selector:</span></a>
+<a class="sourceLine" id="cb7-18" data-line-number="18">    <span class="fu">app:</span><span class="at"> </span><span class="kw">{</span>{ name <span class="kw">}</span><span class="at">}</span></a>
+<a class="sourceLine" id="cb7-19" data-line-number="19">    <span class="fu">service:</span><span class="at"> </span><span class="kw">{</span>{ name <span class="kw">}</span><span class="at">}</span></a></code></pre></div>
+<p>And finally, my <code>templates/route.yml.j2</code>:</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode yaml"><code class="sourceCode yaml"><a class="sourceLine" id="cb8-1" data-line-number="1"><span class="ot">---</span></a>
+<a class="sourceLine" id="cb8-2" data-line-number="2"></a>
+<a class="sourceLine" id="cb8-3" data-line-number="3"><span class="fu">apiVersion:</span><span class="at"> route.openshift.io/v1</span></a>
+<a class="sourceLine" id="cb8-4" data-line-number="4"><span class="fu">kind:</span><span class="at"> Route</span></a>
+<a class="sourceLine" id="cb8-5" data-line-number="5"><span class="fu">metadata:</span></a>
+<a class="sourceLine" id="cb8-6" data-line-number="6">  <span class="fu">name:</span><span class="at"> </span><span class="kw">{</span>{ name <span class="kw">}</span><span class="at">}</span></a>
+<a class="sourceLine" id="cb8-7" data-line-number="7">  <span class="fu">namespace:</span><span class="at"> </span><span class="kw">{</span>{ namespace <span class="kw">}</span><span class="at">}</span></a>
+<a class="sourceLine" id="cb8-8" data-line-number="8">  <span class="fu">labels:</span></a>
+<a class="sourceLine" id="cb8-9" data-line-number="9">    <span class="fu">app:</span><span class="at"> </span><span class="kw">{</span>{ name <span class="kw">}</span><span class="at">}</span></a>
+<a class="sourceLine" id="cb8-10" data-line-number="10">    <span class="fu">service:</span><span class="at"> </span><span class="kw">{</span>{ name <span class="kw">}</span><span class="at">}</span></a>
+<a class="sourceLine" id="cb8-11" data-line-number="11"><span class="fu">spec:</span></a>
+<a class="sourceLine" id="cb8-12" data-line-number="12">  <span class="fu">port:</span></a>
+<a class="sourceLine" id="cb8-13" data-line-number="13">    <span class="fu">targetPort:</span><span class="at"> web</span></a>
+<a class="sourceLine" id="cb8-14" data-line-number="14">  <span class="fu">to:</span></a>
+<a class="sourceLine" id="cb8-15" data-line-number="15">    <span class="fu">kind:</span><span class="at"> Service</span></a>
+<a class="sourceLine" id="cb8-16" data-line-number="16">    <span class="fu">name:</span><span class="at"> </span><span class="kw">{</span>{ name <span class="kw">}</span><span class="at">}</span></a></code></pre></div>
+<p>I skipped over the creation of <code>meta/main.yml</code>, but you can find mine <a href="https://github.com/djzager/ansible-role-hello-world-k8s/blob/ao-galaxy-blog/meta/main.yml">here</a>.</p>
+<p>Now I have an Ansible Role that manages my Hello World application in Kubernetes and can take advantage of APIs if available in the cluster. Using the <code>k8s</code> module with the dynamic client simplifies managing objects in Kubernetes. I hope that this Role helps to showcase the power of Ansible when working with Kubernetes.</p>
+<h1 id="hello-galaxy-meet-kubernetes">Hello Galaxy, Meet Kubernetes</h1>
+<p>Many of the Ansible Roles published to Galaxy are for server configuration and application management. My wish is for Galaxy to be inundated with Roles managing Kubernetes applications.</p>
+<p>Once I have pushed my <a href="https://github.com/djzager/ansible-role-hello-world-k8s/">Role to GitHub</a>, all I need to do is:</p>
+<ol>
+<li>Log into Ansible Galaxy, giving it access to my GitHub repositories.</li>
+<li>Import my role</li>
+</ol>
+<p>My <code>hello_world_k8s</code> role is now publicly available in Galaxy <a href="https://galaxy.ansible.com/djzager/hello_world_k8s">here</a>.</p>
+<h1 id="hello-ansible-operator-meet-galaxy">Hello Ansible Operator, Meet Galaxy</h1>
+<p>If you have a look at my <a href="https://github.com/djzager/ansible-role-hello-world-k8s/">Hello World project in GitHub</a> you may notice that I added the necessary pieces to make an Ansible Operator. These are:</p>
+<ol>
+<li>The <a href="https://github.com/djzager/ansible-role-hello-world-k8s/blob/ao-galaxy-blog/watches.yaml">watches file</a> that provides a mapping of Kubernetes <a href="https://kubernetes.io/docs/concepts/api-extension/custom-resources/">Custom Resources</a> to Ansible Roles or Playbooks.</li>
+<li>The <a href="https://github.com/djzager/ansible-role-hello-world-k8s/blob/ao-galaxy-blog/build/Dockerfile">Dockerfile</a> for building my Operator.</li>
+<li>The <a href="https://github.com/djzager/ansible-role-hello-world-k8s/tree/ao-galaxy-blog/deploy">deploy directory</a> with the Kubernetes specific objects necessary to run my Operator.</li>
+</ol>
+<p>Want to know more about building your own Ansible Operator? Check out the <a href="https://github.com/operator-framework/operator-sdk/blob/master/doc/ansible/user-guide.md">User Guide</a>. But I promised to build an Ansible Operator using my Role published to Galaxy, all I <strong>really</strong> need is a Dockerfile:</p>
+<pre><code>FROM quay.io/operator-framework/ansible-operator
+
+RUN ansible-galaxy install djzager.hello_world_k8s
+
+RUN echo $&#39;--- \n\
+- version: v1alpha1\n\
+  group: examples.djzager.io\n\
+  kind: HelloWorld\n\
+  role: /opt/ansible/roles/djzager.hello_world_k8s&#39; &gt; ${HOME}/watches.yaml
+</code></pre>
+<p>Then building an Operator is:</p>
+<pre><code>$ docker build -t hello-world-operator -f Dockerfile .
+Sending build context to Docker daemon 157.2 kB
+Step 1/3 : FROM quay.io/operator-framework/ansible-operator
+latest: Pulling from operator-framework/ansible-operator
+Digest: sha256:1156066a05fb1e1dd5d4286085518e5ce15acabfff10a8145eef8da088475db3
+Status: Downloaded newer image for quay.io/water-hole/ansible-operator:latest
+ ---&gt; 39cc1d19649d
+Step 2/3 : RUN ansible-galaxy install djzager.hello_world_k8s
+ ---&gt; Running in 83ba8c21f233
+- downloading role &#39;hello_world_k8s&#39;, owned by djzager
+- downloading role from https://github.com/djzager/ansible-role-hello-world-k8s/archive/master.tar.gz
+- extracting djzager.hello_world_k8s to /opt/ansible/roles/djzager.hello_world_k8s
+- djzager.hello_world_k8s (master) was installed successfully
+Removing intermediate container 83ba8c21f233
+ ---&gt; 2f303b45576c
+Step 3/3 : RUN echo $&#39;--- \n- version: v1alpha1\n  group: examples.djzager.io\n    kind: HelloWorld\n      role: /opt/ansible/roles/djzager.hello_world_k8s&#39; &gt; ${HOME}/watches.yaml
+ ---&gt; Running in cced495a9cb4
+Removing intermediate container cced495a9cb4
+ ---&gt; 5827bc3c1ca3
+Successfully built 5827bc3c1ca3
+Successfully tagged hello-world-operator:latest
+</code></pre>
+<p>Admittedly, in order to <strong>use</strong> this Operator you will want to use the <a href="https://github.com/djzager/ansible-role-hello-world-k8s/tree/ao-galaxy-blog/deploy">deploy bits</a> from my project to create the Service Account, Role and Role Binding, Custom Resource Definition, as well as deploy the Operator. Once the Operator is deployed, create the Custom Resource to get an instance of the Hello World application:</p>
+<div class="sourceCode" id="cb11"><pre class="sourceCode yaml"><code class="sourceCode yaml"><a class="sourceLine" id="cb11-1" data-line-number="1"><span class="fu">apiVersion:</span><span class="at"> examples.djzager.io/v1alpha1</span></a>
+<a class="sourceLine" id="cb11-2" data-line-number="2"><span class="fu">kind:</span><span class="at"> HelloWorld</span></a>
+<a class="sourceLine" id="cb11-3" data-line-number="3"><span class="fu">metadata:</span></a>
+<a class="sourceLine" id="cb11-4" data-line-number="4">  <span class="fu">name:</span><span class="at"> example-helloworld</span></a>
+<a class="sourceLine" id="cb11-5" data-line-number="5">  <span class="fu">namespace:</span><span class="at"> default</span></a>
+<a class="sourceLine" id="cb11-6" data-line-number="6"><span class="fu">spec:</span></a>
+<a class="sourceLine" id="cb11-7" data-line-number="7">  <span class="fu">size:</span><span class="at"> 3</span></a></code></pre></div>
+<h2 id="namespace-scoped-vs-cluster-scoped-operators">Namespace Scoped vs Cluster Scoped Operators</h2>
+<p>I previously suggested that you look at my <a href="https://github.com/djzager/ansible-role-hello-world-k8s/tree/ao-galaxy-blog/deploy">deploy directory</a> to find the Kubernetes specific objects necessary to run an Operator. If you look closely you will see 3 things that will constrain this Operator to only manage Custom Resources in the namespace where it is deployed:</p>
+<ol>
+<li><code>WATCH_NAMESPACE</code> environment variable in <a href="https://github.com/djzager/ansible-role-hello-world-k8s/blob/ao-galaxy-blog/deploy/operator.yaml#L25-L28">operator.yaml</a> tells the operator where to watch Custom Resources.</li>
+<li><a href="https://github.com/djzager/ansible-role-hello-world-k8s/blob/ao-galaxy-blog/deploy/role.yaml#L2">role.yaml</a></li>
+<li><a href="https://github.com/djzager/ansible-role-hello-world-k8s/blob/ao-galaxy-blog/deploy/role_binding.yaml#L1">role_binding</a></li>
+</ol>
+<p>This is helpful for developing an operator. If I wanted to make my application available to all users of the cluster, though, I would need the help of a cluster admin. I would need to:</p>
+<ol>
+<li>Create a <code>ClusterRole</code> instead of a <code>Role</code>.</li>
+<li>Create the operator <code>ServiceAccount</code> in the namespace where the operator will be deployed.</li>
+<li>Create a <code>ClusterRoleBinding</code> that binds the namespaced <code>ServiceAccount</code> to the <code>ClusterRole</code></li>
+<li>Deploy the operator with the <code>WATCH_NAMESPACE</code> environment variable unset (or <code>&quot;&quot;</code>).</li>
+</ol>
+<p>Doing so would allow other users of the cluster to deploy instances of my Hello World Application. If this sounds interesting, you should check out the <a href="https://github.com/operator-framework/operator-lifecycle-manager/">Operator Lifecycle Manager</a> (also a part of the Operator Framework).</p>
+<h1 id="next-steps">Next Steps</h1>
+<p>The Hello World application in this post was designed to be intentionally simple but there are still things I could do to make it more robust.</p>
+<ol>
+<li>Use <a href="https://github.com/operator-framework/operator-sdk/">Operator SDK</a> - I skipped this piece in this post to highlight how easy it can be to go from an Ansible Role to an Operator. Using this role with the SDK (think <code>operator-sdk new</code>) would be something I would suggest to do, and most likely necessary, for subsequent steps.</li>
+<li>Validation - right now if a user were to create a CR with <code>size: abc</code> the deployment creation step would simply fail. It would be better for us to catch errors in the spec before attempting to do work.</li>
+<li>Lifecycle - in more complex examples this could be handling version upgrades. In a scenario like this one, where there is only one version of the Hello World application, we could detect when the running container image is out of date when compared to what is available in the corresponding container registry and update the running instances.</li>
+<li>Testing - <a href="https://github.com/ansible/molecule">Molecule</a> helps with the development and testing of Ansible Roles.</li>
+<li><a href="https://github.com/operator-framework/operator-lifecycle-manager/">Operator Lifecycle Manager</a> - is a toolkit for managing Operators. Integration with OLM would allow us to handle installation and upgrades to our Operator.</li>
+<li>Status - we could enable the status subresource on our Hello World CRD and use <code>k8s_status</code> module, provided in the Ansible Operator image, to include status information to the Custom Resource.</li>
+</ol>
+<h1 id="conclusion">Conclusion</h1>
+<p>Now that I have shown you how to build an Ansible Role to manage an application in Kubernetes, publish to Ansible Galaxy, and use that role with Ansible Operator, I hope that you will:</p>
+<ol>
+<li>Use the <a href="https://docs.ansible.com/ansible/latest/modules/k8s_module.html">Ansible <code>k8s</code> module</a>.</li>
+<li>Start flooding <a href="https://galaxy.ansible.com">Ansible Galaxy</a> with roles managing Kubernetes applications.</li>
+<li>Check out <a href="https://github.com/operator-framework/operator-sdk">Operator SDK</a> and join us on the <a href="https://groups.google.com/forum/#!forum/operator-framework">Operator Framework mailing list</a>.</li>
+</ol>
